@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Turn item photos into an editable eBay listing draft." />
+    <title>Listing Helper</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260906-1" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Listing Helper home">
+        <span class="brand-mark" aria-hidden="true">L</span>
+        <span>Listing Helper</span>
+      </a>
+      <nav class="account-nav" aria-label="Account">
+        <a id="saved-drafts-link" href="#saved-drafts-section"
+          >Drafts<span id="saved-drafts-count"></span
+        ></a>
+        <a id="admin-link" href="/admin" hidden>Users</a>
+        <span id="account-email"></span>
+        <button id="logout-button" class="link-button" type="button">Sign out</button>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">One item at a time</p>
+        <h1 id="page-title">Add photos. Get a listing draft.</h1>
+        <p class="hero-copy">
+          Upload clear photos of one item. We’ll organize the useful details, call out
+          what needs your review, and suggest a price.
+        </p>
+      </section>
+
+      <section
+        id="saved-drafts-section"
+        class="workflow-card saved-drafts"
+        aria-labelledby="saved-drafts-heading"
+        tabindex="-1"
+      >
+        <div class="result-header">
+          <div>
+            <p class="eyebrow">Continue where you stopped</p>
+            <h2 id="saved-drafts-heading">Saved drafts</h2>
+          </div>
+        </div>
+        <p id="saved-drafts-status" class="saved-drafts-status" role="status">
+          Loading saved drafts…
+        </p>
+        <p id="browser-storage-total" class="storage-usage" aria-live="polite">
+          Draft photo storage in this browser: checking…
+        </p>
+        <p id="browser-storage-warning" class="message warning-message" role="status" hidden></p>
+        <div id="saved-drafts-list" hidden></div>
+      </section>
+
+      <form id="listing-form" class="workflow-card" novalidate>
+        <section aria-labelledby="photos-heading">
+          <div class="section-heading">
+            <div>
+              <span class="step">1</span>
+              <h2 id="photos-heading">Add item photos</h2>
+            </div>
+            <span id="photo-count" class="count">0 / 24</span>
+          </div>
+
+          <label id="drop-zone" class="drop-zone" for="photo-input">
+            <span class="upload-icon" aria-hidden="true">＋</span>
+            <strong>Choose photos</strong>
+            <span>or drop them here</span>
+            <small>1–24 photos · 12 MB each · eBay-supported image formats</small>
+          </label>
+          <input
+            id="photo-input"
+            class="visually-hidden"
+            type="file"
+            accept=".jpg,.jpeg,.png,.gif,.tif,.tiff,.bmp,.webp,.heic,.heif,.avif,image/*"
+            multiple
+          />
+          <p class="field-help">Put the strongest overall photo first. You can reorder below.</p>
+          <p id="current-photo-storage" class="storage-usage" aria-live="polite">
+            Current photos: 0 MB
+          </p>
+          <div id="photo-list" class="photo-list" aria-live="polite"></div>
+        </section>
+
+        <section aria-labelledby="notes-heading">
+          <div class="section-heading">
+            <div>
+              <span class="step">2</span>
+              <h2 id="notes-heading">Add anything photos can’t show</h2>
+            </div>
+            <span class="optional">Optional</span>
+          </div>
+          <label class="visually-hidden" for="notes">Seller notes</label>
+          <textarea
+            id="notes"
+            name="notes"
+            maxlength="2000"
+            rows="4"
+            placeholder="Measurements, flaws, model number, included accessories…"
+          ></textarea>
+        </section>
+
+        <section class="generation-category" aria-labelledby="generation-category-heading">
+          <div class="section-heading">
+            <div><span class="step">3</span><h2 id="generation-category-heading">Select the eBay category</h2></div>
+            <span class="optional">Required</span>
+          </div>
+          <div class="category-menus">
+            <div>
+              <label for="generation-category-group">Category group</label>
+              <select id="generation-category-group">
+                <option value="">Select a group</option>
+              </select>
+            </div>
+            <div>
+              <label for="generation-category">Category for generation</label>
+              <select id="generation-category" aria-describedby="generation-category-status">
+                <option value="">Select a group first</option>
+              </select>
+            </div>
+          </div>
+          <button id="generation-category-retry" class="link-button" type="button" hidden>Retry categories</button>
+          <p id="generation-category-status" class="field-help" role="status"></p>
+        </section>
+        <p id="category-regeneration-message" class="message" role="status" hidden></p>
+        <p id="generation-readiness" class="field-help" role="status"></p>
+        <div id="error-message" class="message error-message" role="alert" hidden></div>
+        <button id="generate-button" class="primary-button" type="submit" disabled aria-describedby="generation-readiness">
+          <span class="button-label">Generate listing</span>
+          <span class="button-loading" hidden>Looking over your photos…</span>
+        </button>
+        <p class="privacy-note">
+          Your photos are sent securely to our server and analyzed by OpenAI. This browser
+          keeps a device-local copy with the draft until you delete it. Other browsers do
+          not receive that copy.
+        </p>
+      </form>
+
+      <section id="ebay-connection" class="workflow-card ebay-connection" aria-labelledby="ebay-heading">
+        <div class="result-header">
+          <div>
+            <p class="eyebrow">Optional next step</p>
+            <h2 id="ebay-heading">eBay connection</h2>
+          </div>
+          <button id="ebay-connect-button" class="secondary-button" type="button" hidden>
+            Connect eBay
+          </button>
+          <button id="ebay-disconnect-button" class="link-button" type="button" hidden>
+            Disconnect
+          </button>
+        </div>
+        <p id="ebay-connection-status">Checking your eBay connection…</p>
+      </section>
+
+      <section id="result-section" class="result-card" aria-labelledby="result-heading" hidden>
+        <div class="result-header">
+          <div>
+            <p class="eyebrow">Ready to review</p>
+            <h2 id="result-heading">Your listing draft</h2>
+          </div>
+          <div class="result-actions">
+            <span id="draft-save-status" class="count" aria-live="polite"></span>
+            <button id="start-new-listing-button" class="secondary-button" type="button" hidden>
+              Start new listing
+            </button>
+            <button id="save-draft-button" class="link-button" type="button" hidden>Save now</button>
+            <button id="copy-button" class="secondary-button" type="button">Copy listing</button>
+          </div>
+        </div>
+        <p
+          id="draft-save-message"
+          class="message warning-message"
+          role="status"
+          aria-live="assertive"
+          hidden
+        ></p>
+        <p id="photo-reselect-message" class="message warning-message" hidden>
+          This browser does not have this draft’s photos. Select the originals again before
+          you publish. Photos saved in another browser do not transfer to this one.
+        </p>
+        <p id="published-draft-message" class="message" hidden>
+          This draft is published and read-only. Use Seller Hub to change the live listing.
+          It and its device-local photos remain here until you delete the draft.
+        </p>
+        <div id="warning-list" class="message warning-message" hidden></div>
+        <p class="review-note">
+          Check every detail before listing. Highlighted unknowns need your input.
+        </p>
+        <div id="draft-fields" class="draft-fields"></div>
+        <div class="pricing-disclaimer">
+          Pricing is editable LLM guidance—not a live market quote or guarantee.
+        </div>
+        <section id="ebay-draft-section" class="ebay-draft-section" hidden>
+          <p class="eyebrow">Direct eBay publication</p>
+          <h3>Publish this reviewed listing</h3>
+          <p>
+            This action saves your edits, checks required eBay fields, uploads the photos,
+            verifies the listing, and publishes it live. You can edit it later in Seller Hub.
+          </p>
+          <div class="ebay-fields">
+            <label for="ebay-category">eBay category</label>
+            <select id="ebay-category" aria-describedby="ebay-publish-readiness"></select>
+            <button id="draft-category-search" class="link-button" type="button">Find other categories for this draft</button>
+            <label for="ebay-condition">eBay condition</label>
+            <select id="ebay-condition" aria-describedby="ebay-publish-readiness" disabled>
+              <option value="">Choose a category first</option>
+            </select>
+            <fieldset class="package-weight-field">
+              <legend>Package weight</legend>
+              <div class="package-weight-inputs">
+                <label for="package-weight-pounds">
+                  Pounds
+                  <input
+                    id="package-weight-pounds"
+                    type="number"
+                    inputmode="numeric"
+                    min="0"
+                    step="1"
+                    value="0"
+                    aria-describedby="ebay-publish-readiness"
+                  />
+                </label>
+                <label for="package-weight-ounces">
+                  Ounces
+                  <input
+                    id="package-weight-ounces"
+                    type="number"
+                    inputmode="numeric"
+                    min="0"
+                    max="15"
+                    step="1"
+                    value="0"
+                    aria-describedby="ebay-publish-readiness"
+                  />
+                </label>
+              </div>
+            </fieldset>
+            <fieldset class="package-dimensions-field">
+              <legend>Package dimensions (inches)</legend>
+              <div class="package-dimensions-inputs">
+                <label for="package-length">
+                  Length
+                  <input
+                    id="package-length"
+                    type="number"
+                    inputmode="decimal"
+                    min="1"
+                    step="any"
+                    aria-describedby="package-dimensions-help package-dimensions-status ebay-publish-readiness"
+                  />
+                </label>
+                <label for="package-width">
+                  Width
+                  <input
+                    id="package-width"
+                    type="number"
+                    inputmode="decimal"
+                    min="1"
+                    step="any"
+                    aria-describedby="package-dimensions-help package-dimensions-status ebay-publish-readiness"
+                  />
+                </label>
+                <label for="package-height">
+                  Height
+                  <input
+                    id="package-height"
+                    type="number"
+                    inputmode="decimal"
+                    min="1"
+                    step="any"
+                    aria-describedby="package-dimensions-help package-dimensions-status ebay-publish-readiness"
+                  />
+                </label>
+              </div>
+              <p id="package-dimensions-help" class="field-help">
+                The app rounds positive decimals up to the next whole inch.
+              </p>
+              <p
+                id="package-dimensions-status"
+                class="field-help rounding-status"
+                role="status"
+                aria-live="polite"
+                hidden
+              ></p>
+            </fieldset>
+            <div id="fulfillment-policy-field" hidden>
+              <label for="fulfillment-policy">Shipping policy</label>
+              <select id="fulfillment-policy"></select>
+            </div>
+            <div id="payment-policy-field" hidden>
+              <label for="payment-policy">Payment policy</label>
+              <select id="payment-policy"></select>
+            </div>
+            <div id="return-policy-field" hidden>
+              <label for="return-policy">Return policy</label>
+              <select id="return-policy"></select>
+            </div>
+          </div>
+          <p id="ebay-policy-status" class="message warning-message" hidden></p>
+          <div id="ebay-requirements" class="message warning-message" hidden></div>
+          <div id="ebay-transfer-status" class="message" hidden></div>
+          <div
+            id="ebay-publish-readiness"
+            class="message warning-message"
+            role="status"
+            aria-live="polite"
+            hidden
+          ></div>
+          <button id="send-to-ebay-button" class="primary-button" type="button" disabled>
+            Publish live on eBay
+          </button>
+        </section>
+      </section>
+    </main>
+
+    <footer>
+      Built for a two-person resale workflow. · <a href="/privacy">Privacy Policy</a>
+    </footer>
+    <script type="module" src="/static/app.js?v=20260906-1"></script>
+  </body>
+</html>

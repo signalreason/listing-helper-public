@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · Listing Helper</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="narrow-page">
+      <a class="brand" href="/login">
+        <span class="brand-mark" aria-hidden="true">L</span>
+        <span>Listing Helper</span>
+      </a>
+
+      <section class="workflow-card auth-card" aria-labelledby="auth-heading">
+        <p class="eyebrow">Private household app</p>
+        <h1 id="auth-heading">Sign in</h1>
+
+        <form id="login-form">
+          <label for="login-email">Email address</label>
+          <input id="login-email" type="email" autocomplete="username" required />
+          <label for="login-password">Password</label>
+          <input id="login-password" type="password" autocomplete="current-password" required />
+          <div id="login-error" class="message error-message" role="alert" hidden></div>
+          <button class="primary-button" type="submit">Sign in</button>
+        </form>
+
+        <form id="setup-form" hidden>
+          <p class="field-help">Create the first owner account once. You’ll copy its generated password on the next screen.</p>
+          <label for="setup-email">Owner email address</label>
+          <input id="setup-email" type="email" autocomplete="email" required />
+          <label for="setup-token">Setup token</label>
+          <input id="setup-token" type="password" autocomplete="off" required />
+          <div id="setup-error" class="message error-message" role="alert" hidden></div>
+          <button class="primary-button" type="submit">Create owner account</button>
+        </form>
+
+        <section id="setup-result" class="password-result" hidden>
+          <h2>Save your password now</h2>
+          <p>This password is shown once. Store it in your password manager.</p>
+          <div class="copy-row">
+            <code id="setup-password"></code>
+            <button id="copy-setup-password" class="secondary-button" type="button">Copy password</button>
+          </div>
+          <a class="primary-link" href="/">Continue to the app</a>
+        </section>
+      </section>
+    </main>
+    <footer><a href="/privacy">Privacy Policy</a></footer>
+    <script type="module" src="/static/login.js"></script>
+  </body>
+</html>

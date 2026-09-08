@@ -1,0 +1,46 @@
+[project]
+name = "ebay-listing-assistant"
+version = "0.1.0"
+description = "Turn item photos into an editable eBay listing draft."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "argon2-cffi",
+    "cryptography",
+    "email-validator",
+    "fastapi",
+    "httpx",
+    "itsdangerous",
+    "openai",
+    "pillow",
+    "pillow-heif",
+    "psycopg[binary]",
+    "python-multipart",
+    "uvicorn[standard]",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2",
+    "pytest",
+    "pytest-playwright",
+    "ruff",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = "-m 'not browser'"
+pythonpath = ["."]
+markers = [
+    "browser: end-to-end browser tests (run with: uv run pytest -m browser)",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

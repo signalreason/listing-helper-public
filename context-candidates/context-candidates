@@ -1,0 +1,938 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "yaml"
+require "optparse"
+require "open3"
+require "pathname"
+require "set"
+require "digest"
+require "date"
+require "strscan"
+
+class ContextCandidates
+  DEFAULT_MAX_FILES = 20
+  DEFAULT_MAX_TOTAL_FILES = 80
+  DEFAULT_MAX_MATCHES_PER_FILE = 8
+  DEFAULT_SNIPPET_CONTEXT = 5
+  DEFAULT_MAX_SNIPPET_LINES = 80
+  MAX_LINE_CHARACTERS = 1000
+
+  SOURCE_EXTENSIONS = %w[
+    .rb .rake .go .js .jsx .ts .tsx .py .php .pl .pm .java .kt .kts
+    .rs .c .h .cc .cpp .hpp .cs .ex .exs .erl .hrl .sh .bash .zsh
+    .sql .graphql .gql .proto .erb .haml .slim .vue .svelte .html .css
+  ].freeze
+
+  TEST_PATTERNS = [
+    %r{(^|/)(test|tests|spec|specs)/}i,
+    %r{(^|/)test_[^/]+\.[^.]+$}i,
+    /_test\.[^.]+$/i,
+    /_spec\.[^.]+$/i,
+    /\.test\.[^.]+$/i,
+    /\.spec\.[^.]+$/i
+  ].freeze
+
+  CONTRACT_PATTERNS = [
+    %r{(^|/)db/schema\.rb$},
+    %r{(^|/)db/structure\.sql$},
+    %r{(^|/)config/routes\.[^.]+$},
+    %r{(^|/)(schema|schemas|migrations?|contracts?|serializers?|openapi|api)/}i,
+    /(^|\/)openapi\.(ya?ml|json)$/i,
+    /(^|\/)swagger\.(ya?ml|json)$/i,
+    /\.proto$/i,
+    /\.graphql$/i,
+    /\.gql$/i
+  ].freeze
+
+  INSTRUCTION_PATTERNS = [
+    %r{(^|/)AGENTS\.md$},
+    %r{(^|/)CLAUDE\.md$}
+  ].freeze
+
+  DECISION_PATTERNS = [
+    %r{(^|/)docs/(decisions|adr|adrs)/}i,
+    %r{(^|/)(decisions|adr|adrs)/}i
+  ].freeze
+
+  STOP_WORDS = Set.new(%w[
+    a an and are as at be been being but by can could did do does doing for from
+    had has have having he her hers him his i if in into is it its itself may me
+    might more most must my no not of on once only or other our ours out over own
+    same should so some such than that the their theirs them themselves then there
+    these they this those through to too under until up very was we were what when
+    where which while who why will with would you your yours
+    user users story task tasks acceptance criteria assumption assumptions tech note notes
+    done when required behavior goal implementation generated model human written
+  ]).freeze
+
+  attr_reader :repo, :task_input, :story_input, :story_tasks_input, :max_files, :max_total_files,
+              :max_matches_per_file, :snippet_context, :max_snippet_lines, :base_revision
+
+  def initialize(repo:, task:, story:, story_tasks: nil, max_files: DEFAULT_MAX_FILES,
+                 max_total_files: DEFAULT_MAX_TOTAL_FILES,
+                 max_matches_per_file: DEFAULT_MAX_MATCHES_PER_FILE,
+                 snippet_context: DEFAULT_SNIPPET_CONTEXT,
+                 max_snippet_lines: DEFAULT_MAX_SNIPPET_LINES,
+                 base_revision: nil)
+    @repo = File.expand_path(repo)
+    @task_input = task
+    @story_input = story
+    @story_tasks_input = story_tasks
+    @max_files = max_files
+    @max_total_files = max_total_files
+    @max_matches_per_file = max_matches_per_file
+    @snippet_context = snippet_context
+    @max_snippet_lines = max_snippet_lines
+    @base_revision = base_revision
+  end
+
+  def run
+    validate_repo!
+
+    task = load_input(task_input)
+    story = load_input(story_input)
+    story_tasks = story_tasks_input ? load_input(story_tasks_input) : nil
+
+    tracked_files = git_ls_files
+    requirements = extract_requirements(task, story)
+    terms = extract_terms(requirements)
+    phrases = extract_phrases(requirements)
+
+    matches = search_repo(tracked_files, terms, phrases)
+    primary = rank_primary(matches, tracked_files, terms, phrases)
+    instructions = applicable_instructions([], tracked_files)
+    decisions = related_decisions(tracked_files, terms, phrases)
+
+    categories = {
+      "primary" => primary,
+      "tests" => [],
+      "contracts" => [],
+      "dependencies" => [],
+      "decisions" => decisions,
+      "instructions" => instructions,
+      "prerequisites" => []
+    }
+
+    dedupe_categories!(categories)
+    apply_total_file_cap!(categories, tracked_files)
+
+    # Imports must come from the same primary set retained in the output, after
+    # both per-category and total-file limits have been applied.
+    retained_primary = categories.fetch("primary")
+    categories["tests"] = related_tests(retained_primary, tracked_files, terms, matches)
+    categories["contracts"] = related_contracts(retained_primary, tracked_files, terms, matches)
+    categories["dependencies"] = one_hop_dependencies(retained_primary, tracked_files)
+    prerequisites, prerequisite_matches = prerequisite_candidates(story_tasks, tracked_files)
+    categories["prerequisites"] = prerequisites
+    dedupe_categories!(categories)
+    apply_total_file_cap!(categories, tracked_files)
+    output_matches = matches.merge(prerequisite_matches) do |_, current, prior|
+      (current + prior).uniq { |match| [match["pattern"], match["line"]] }
+    end
+
+    {
+      "metadata" => metadata(task, story),
+      "requirements" => requirements,
+      "search" => {
+        "terms" => terms,
+        "phrases" => phrases
+      },
+      "candidates" => categories.transform_values { |files| files.map { |path| candidate_record(path, output_matches[path] || []) } }
+    }
+  end
+
+  private
+
+  def validate_repo!
+    raise "Repository does not exist: #{repo}" unless Dir.exist?(repo)
+    _out, _err, status = Open3.capture3("git", "-C", repo, "rev-parse", "--is-inside-work-tree")
+    raise "Not a git repository: #{repo}" unless status.success?
+  end
+
+  def load_input(value)
+    if File.file?(value)
+      text = File.read(value)
+      parsed = parse_structured(text, File.extname(value))
+      { "source" => File.expand_path(value), "data" => parsed, "text" => text }
+    else
+      parsed = parse_structured(value, nil)
+      { "source" => "inline", "data" => parsed, "text" => value }
+    end
+  end
+
+  def parse_structured(text, extension)
+    case extension
+    when ".json"
+      JSON.parse(text)
+    when ".yaml", ".yml"
+      YAML.safe_load(text, permitted_classes: [Date, Time], aliases: false) || text
+    else
+      begin
+        JSON.parse(text)
+      rescue JSON::ParserError
+        begin
+          parsed = YAML.safe_load(text, permitted_classes: [Date, Time], aliases: false)
+          parsed.is_a?(Hash) || parsed.is_a?(Array) ? parsed : text
+        rescue Psych::SyntaxError
+          text
+        end
+      end
+    end
+  end
+
+  def git_ls_files
+    out, err, status = Open3.capture3("git", "-C", repo, "ls-files", "-z")
+    raise "git ls-files failed: #{err}" unless status.success?
+    out.split("\0").reject(&:empty?).select { |path| safe_repo_file?(path) }.sort
+  end
+
+  def metadata(task, story)
+    head = git_output("rev-parse", "HEAD").strip
+    base = base_revision ? git_output("rev-parse", base_revision).strip : head
+    {
+      "repo" => repo,
+      "head_revision" => head,
+      "base_revision" => base,
+      "task_source" => task["source"],
+      "story_source" => story["source"],
+      "compiler_version" => "1.0.0"
+    }
+  end
+
+  def git_output(*args)
+    out, err, status = Open3.capture3("git", "-C", repo, *args)
+    raise "git #{args.join(' ')} failed: #{err}" unless status.success?
+    out
+  end
+
+  def extract_requirements(task, story)
+    task_text = flatten_text(task["data"])
+    story_text = flatten_text(story["data"])
+
+    structured_task = task["data"].is_a?(Hash)
+    referenced_ids = if structured_task
+      Array(task["data"]["story_clauses"]).select do |id|
+        id.is_a?(String) && id.match?(/\A(?:BEH|ASM|TECH|AC)-\d+\z/i)
+      end.map(&:upcase).uniq.sort
+    else
+      task_text.scan(/\b(?:BEH|ASM|TECH|AC)-\d+\b/i).map(&:upcase).uniq.sort
+    end
+    referenced_story = if !structured_task && referenced_ids.empty?
+      story_text
+    else
+      extract_story_clauses(story, referenced_ids)
+    end
+
+    {
+      "task" => task_text,
+      "story" => referenced_story,
+      "referenced_story_ids" => referenced_ids
+    }
+  end
+
+  def extract_story_clauses(story, ids)
+    clauses = records_with_ids(story["data"])
+    ids.map do |id|
+      clause = clauses.find { |record| record["id"].to_s.upcase == id }
+      if clause
+        flatten_text(clause)
+      else
+        # Plain-text stories may put the clause and its ID on one line. Preserve
+        # an unmatched ID so the next stage can identify missing story context.
+        line = story["text"].lines.find { |value| value.match?(/\b#{Regexp.escape(id)}\b/i) }
+        line ? line.strip : id
+      end
+    end.join("\n")
+  end
+
+  def records_with_ids(value)
+    case value
+    when Hash
+      own = value.key?("id") ? [value] : []
+      own + value.values.flat_map { |child| records_with_ids(child) }
+    when Array
+      value.flat_map { |child| records_with_ids(child) }
+    else
+      []
+    end
+  end
+
+  def flatten_text(value)
+    case value
+    when Hash
+      value.keys.sort.map { |key| flatten_text(value[key]) }.join("\n")
+    when Array
+      value.map { |v| flatten_text(v) }.join("\n")
+    else
+      value.to_s
+    end
+  end
+
+  def extract_terms(requirements)
+    text = [requirements["task"], requirements["story"]].join("\n")
+    words = text.downcase.scan(/[a-z][a-z0-9_\-]{2,}/)
+
+    counts = Hash.new(0)
+    words.each do |word|
+      normalized = normalize_term(word)
+      next if normalized.length < 3 || STOP_WORDS.include?(normalized)
+      counts[normalized] += 1
+    end
+
+    counts
+      .sort_by { |term, count| [-count, -term.length, term] }
+      .map(&:first)
+      .first(30)
+  end
+
+  def normalize_term(term)
+    term.downcase
+        .sub(/'s\z/, "")
+        .gsub(/[^a-z0-9_\-]/, "")
+  end
+
+  def extract_phrases(requirements)
+    text = [requirements["task"], requirements["story"]].join("\n")
+    phrases = []
+
+    text.scan(/["'`](.{3,80}?)["'`]/).each { |m| phrases << m.first.strip.downcase }
+
+    text.lines.each do |line|
+      cleaned = line.downcase.gsub(/[^a-z0-9_\- ]+/, " ").squeeze(" ").strip
+      tokens = cleaned.split.reject { |t| STOP_WORDS.include?(t) || t.length < 3 }
+      (2..3).each do |n|
+        tokens.each_cons(n) { |group| phrases << group.join(" ") }
+      end
+    end
+
+    phrases
+      .select { |p| p.length.between?(5, 60) }
+      .uniq
+      .sort_by { |p| [-p.split.length, -p.length, p] }
+      .first(20)
+  end
+
+  def search_repo(tracked_files, terms, phrases)
+    patterns = (phrases + terms).uniq
+    return {} if patterns.empty?
+
+    # git grep searches the tracked working tree by default, which is exactly the
+    # candidate universe we want. It is both cheaper and more deterministic than
+    # asking an LLM to enumerate files or searching ignored/untracked files.
+    search_with_git_grep(patterns, tracked_files)
+  rescue StandardError
+    search_with_ruby(tracked_files, patterns)
+  end
+
+  def search_with_git_grep(patterns, tracked_files)
+    matches = Hash.new { |h, k| h[k] = [] }
+    return matches if tracked_files.empty?
+
+    patterns.each_with_index do |pattern, priority|
+      out, err, status = Open3.capture3(
+        "git", "--literal-pathspecs", "-C", repo, "grep", "-n", "-I", "-i", "-F", "--", pattern, *tracked_files
+      )
+
+      # git grep exits 1 when there are no matches. Any other non-zero status is
+      # an actual failure and should trigger the Ruby fallback.
+      raise "git grep failed: #{err}" unless status.success? || status.exitstatus == 1
+
+      out.each_line do |line|
+        path, line_no, text = line.split(":", 3)
+        next unless path && line_no && text
+        matches[path] << {
+          "pattern" => pattern,
+          "priority" => priority,
+          "line" => line_no.to_i,
+          "text" => bounded_line(text.rstrip, pattern)
+        }
+      end
+    end
+
+    matches.each_value { |arr| arr.uniq! { |m| [m["pattern"], m["line"]] } }
+    matches
+  end
+
+  def search_with_ruby(tracked_files, patterns)
+    matches = Hash.new { |h, k| h[k] = [] }
+    tracked_files.each do |path|
+      abs = File.join(repo, path)
+      next unless safe_repo_file?(abs)
+      lines = safe_read_lines(abs)
+      lines.each_with_index do |line, idx|
+        down = line.downcase
+        patterns.each_with_index do |pattern, priority|
+          next unless down.include?(pattern.downcase)
+          matches[path] << { "pattern" => pattern, "priority" => priority, "line" => idx + 1, "text" => bounded_line(line.rstrip, pattern) }
+        end
+      end
+    end
+    matches
+  end
+
+  def rank_primary(matches, tracked_files, terms, phrases)
+    candidates = matches.keys.select do |path|
+      source_file?(path) && !test_file?(path) && !contract_file?(path) &&
+        !instruction_file?(path) && !decision_file?(path)
+    end
+    candidates.sort_by do |path|
+      file_matches = matches[path]
+      unique_patterns = file_matches.map { |m| m["pattern"] }.uniq.length
+      phrase_hits = file_matches.count { |m| phrases.include?(m["pattern"]) }
+      term_hits = file_matches.count { |m| terms.include?(m["pattern"]) }
+      path_term_hits = terms.count { |t| path.downcase.include?(t.downcase) }
+      score = unique_patterns * 12 + phrase_hits * 8 + term_hits * 2 + path_term_hits * 10
+      [-score, path]
+    end
+  end
+
+  def related_tests(primary, tracked_files, terms, matches)
+    tests = tracked_files.select { |p| test_file?(p) && !instruction_file?(p) }
+    primary_basenames = primary.map { |p| File.basename(p, File.extname(p)).sub(/(_test|_spec)\z/, "") }.uniq
+
+    scored = tests.map do |path|
+      base = File.basename(path, File.extname(path)).sub(/(_test|_spec)\z/, "")
+      score = 0
+      score += 40 if primary_basenames.include?(base)
+      primary_basenames.each { |b| score += 15 if path.include?(b) || base.include?(b) }
+      terms.each { |t| score += 4 if path.downcase.include?(t) }
+      score += matches.fetch(path, []).map { |m| m["pattern"] }.uniq.length * 3
+      [path, score]
+    end
+
+    scored.select { |_, score| score.positive? }.sort_by { |path, score| [-score, path] }.map(&:first)
+  end
+
+  def related_contracts(primary, tracked_files, terms, matches)
+    contracts = tracked_files.select { |p| contract_file?(p) && !instruction_file?(p) }
+    primary_dirs = primary.map { |p| File.dirname(p) }.uniq
+    has_model = primary.any? { |p| p.match?(%r{(^|/)models?/}) }
+    has_controller = primary.any? { |p| p.match?(%r{(^|/)controllers?/}) }
+
+    scored = contracts.map do |path|
+      score = 0
+      score += 15 if primary_dirs.any? { |d| d != "." && path.start_with?(d + "/") }
+      terms.each { |t| score += 5 if path.downcase.include?(t) }
+      score += matches.fetch(path, []).map { |m| m["pattern"] }.uniq.length * 4
+      score += 12 if has_model && ["db/schema.rb", "db/structure.sql"].include?(path)
+      score += 10 if has_controller && path.match?(%r{(^|/)config/routes\.[^.]+$})
+      [path, score]
+    end
+
+    scored.select { |_, score| score.positive? }
+          .sort_by { |path, score| [-score, path] }
+          .map(&:first)
+  end
+
+  def applicable_instructions(primary, tracked_files)
+    instructions = tracked_files.select { |p| instruction_file?(p) }
+    selected = []
+
+    selected.concat(instructions.select { |path| File.dirname(path) == "." })
+
+    primary.each do |path|
+      dirs = ancestor_dirs(File.dirname(path))
+      dirs.each do |dir|
+        %w[AGENTS.md CLAUDE.md].each do |basename|
+          candidate = File.join(dir, basename)
+          selected << candidate if instructions.include?(candidate)
+        end
+      end
+    end
+
+    selected.compact.uniq
+  end
+
+  def related_decisions(tracked_files, terms, phrases)
+    decisions = tracked_files.select { |p| decision_file?(p) && !instruction_file?(p) }
+    return [] if decisions.empty?
+
+    patterns = (phrases + terms).first(20)
+    scores = decisions.map do |path|
+      abs = File.join(repo, path)
+      text = safe_read(abs).downcase
+      score = patterns.sum { |p| text.include?(p.downcase) ? (phrases.include?(p) ? 8 : 2) : 0 }
+      score += terms.sum { |t| path.downcase.include?(t) ? 5 : 0 }
+      [path, score]
+    end
+
+    scores.select { |_, score| score.positive? }.sort_by { |path, score| [-score, path] }.map(&:first)
+  end
+
+  def one_hop_dependencies(primary, tracked_files)
+    tracked = tracked_files.to_set
+    deps = Set.new
+
+    primary.each do |path|
+      abs = File.join(repo, path)
+      next unless File.file?(abs)
+      text = safe_read(abs)
+      extract_dependency_strings(path, text).each do |dep|
+        resolve_dependency(path, dep, tracked).each { |resolved| deps << resolved }
+      end
+    end
+
+    deps.delete_if { |p| primary.include?(p) || test_file?(p) || instruction_file?(p) }
+    deps.to_a
+  end
+
+  def extract_dependency_strings(path, text)
+    ext = File.extname(path)
+    deps = []
+    append = ->(offset, value) { deps << [offset, deps.length, value] }
+
+    case ext
+    when ".rb", ".rake"
+      text.scan(/^\s*require_relative\s+["']([^"']+)["']/) do |match|
+        dep = match.first
+        append.call(Regexp.last_match.begin(0), dep.start_with?(".", "/") ? dep : "./#{dep}")
+      end
+      text.scan(/^\s*require\s+["']([^"']+)["']/) do |match|
+        append.call(Regexp.last_match.begin(0), match.first) if match.first.start_with?(".")
+      end
+    when ".go"
+      go_dependencies(text).each { |offset, value| append.call(offset, value) }
+    when ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"
+      javascript_dependencies(text).each { |offset, value| append.call(offset, value) }
+    when ".py"
+      code = python_code(text)
+      from_ranges = []
+      code.scan(/\bfrom\s+([.\w]+)\s+import\s+(\([^)]*\)|[^\n;]+)/) do |base, names|
+        offset = Regexp.last_match.begin(0)
+        from_ranges << (offset...Regexp.last_match.end(0))
+        append.call(offset, base)
+        names.gsub(/#[^\n]*/, "").delete("()").split(",").each do |name|
+          imported = name.strip[/\A[A-Za-z_]\w*/]
+          next unless imported
+          append.call(offset, "#{base}#{base.end_with?(".") ? "" : "."}#{imported}")
+        end
+      end
+      code.scan(/\bimport\s+([^\n;]+)/) do |names|
+        offset = Regexp.last_match.begin(0)
+        next if from_ranges.any? { |range| range.cover?(offset) }
+        names.first.split(",").each do |name|
+          imported = name.strip[/\A[\w.]+/]
+          append.call(offset, imported) if imported
+        end
+      end
+    end
+
+    deps.sort_by { |offset, order, _| [offset, order] }.map { |_, _, value| value }.uniq
+  end
+
+  def python_code(text)
+    # Preserve character positions while masking examples and comments. Python
+    # import declarations do not use string operands, so their grammar remains.
+    literals = /'''(?:\\.|(?!''').)*?(?:'''|\z)|"""(?:\\.|(?!""").)*?(?:"""|\z)|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|\#[^\n]*/m
+    text.gsub(literals) { |value| value.gsub(/[^\n]/, " ") }
+        .gsub(/\\\r?\n/) { |value| " " * value.length }
+  end
+
+  def code_tokens(text, language:)
+    scanner = StringScanner.new(text)
+    tokens = []
+    go = language == :go
+    expression_starts = ["=", "(", "[", "{", ",", ":", ";", "!", "?", "return", ">", "&", "|"]
+    until scanner.eos?
+      next if scanner.scan(/\s+/) || scanner.scan(%r{//[^\n]*|/\*.*?(?:\*/|\z)}m)
+      offset = scanner.pos
+      if (value = scanner.scan(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/m))
+        tokens << [go && value.start_with?("'") ? :literal : :string, value[1...-1], offset]
+      elsif go && (value = scanner.scan(/`[^`]*`/m))
+        tokens << [:string, value[1...-1], offset]
+      elsif !go && scanner.scan(/`(?:\\.|[^`\\])*`/m)
+        tokens << [:literal, "template", offset]
+      elsif !go && (tokens.empty? || expression_starts.include?(tokens.last[1])) &&
+            scanner.scan(%r{/(?:\\.|[^/\\\[\n]|\[(?:\\.|[^\]\\])*\])+/[a-z]*})
+        tokens << [:literal, "regexp", offset]
+      elsif (value = scanner.scan(/[A-Za-z_$][A-Za-z0-9_$]*/))
+        tokens << [:identifier, value, offset]
+      else
+        tokens << [:punctuation, scanner.getch, offset]
+      end
+    end
+    tokens
+  end
+
+  def javascript_dependencies(text)
+    tokens = code_tokens(text, language: :javascript)
+    dependencies = []
+    tokens.each_with_index do |token, index|
+      kind, value, offset = token
+      next unless kind == :identifier
+      next if index.positive? && tokens[index - 1][1] == "."
+      following = tokens[index + 1]
+      if value == "require" && following && following[1] == "(" &&
+         tokens[index + 2] && tokens[index + 2][0] == :string &&
+         tokens[index + 3] && tokens[index + 3][1] == ")"
+        dependencies << [offset, tokens[index + 2][1]]
+      elsif value == "import" && following
+        if following[0] == :string
+          dependencies << [offset, following[1]]
+        elsif following[1] == "(" && tokens[index + 2] && tokens[index + 2][0] == :string &&
+              tokens[index + 3] && [")", ","].include?(tokens[index + 3][1])
+          dependencies << [offset, tokens[index + 2][1]]
+        elsif following[1] != "." && following[1] != "("
+          cursor = index + 1
+          while cursor < tokens.length && tokens[cursor][1] != ";"
+            if tokens[cursor][0] == :identifier && tokens[cursor][1] == "from" &&
+               tokens[cursor + 1] && tokens[cursor + 1][0] == :string
+              dependencies << [offset, tokens[cursor + 1][1]]
+              break
+            end
+            cursor += 1
+          end
+        end
+      end
+    end
+    dependencies
+  end
+
+  def go_dependencies(text)
+    tokens = code_tokens(text, language: :go)
+    dependencies = []
+    tokens.each_with_index do |token, index|
+      next unless token[0] == :identifier && token[1] == "import"
+      cursor = index + 1
+      following = tokens[cursor]
+      next unless following
+      if following[1] == "("
+        cursor += 1
+        while cursor < tokens.length && tokens[cursor][1] != ")"
+          item = tokens[cursor]
+          dependencies << [item[2], item[1]] if item[0] == :string
+          cursor += 1
+        end
+      else
+        cursor += 1 if following[0] == :identifier || following[1] == "."
+        item = tokens[cursor]
+        dependencies << [item[2], item[1]] if item && item[0] == :string
+      end
+    end
+    dependencies
+  end
+
+  def resolve_dependency(source_path, dep, tracked)
+    ext = File.extname(source_path)
+    source_dir = File.dirname(source_path)
+    candidates = []
+
+    case ext
+    when ".rb", ".rake"
+      return [] unless dep.start_with?(".")
+      base = File.expand_path(dep, File.join(repo, source_dir))
+      [base, "#{base}.rb"].each do |abs|
+        rel = relative_if_inside_repo(abs)
+        candidates << rel if rel && tracked.include?(rel)
+      end
+    when ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"
+      return [] unless dep.start_with?(".")
+      base = File.expand_path(dep, File.join(repo, source_dir))
+      exact = relative_if_inside_repo(base)
+      candidates << exact if exact && tracked.include?(exact)
+      %w[.js .jsx .ts .tsx .vue .svelte].each do |suffix|
+        rel = relative_if_inside_repo(base + suffix)
+        candidates << rel if rel && tracked.include?(rel)
+      end
+      %w[index.js index.jsx index.ts index.tsx].each do |name|
+        rel = relative_if_inside_repo(File.join(base, name))
+        candidates << rel if rel && tracked.include?(rel)
+      end
+    when ".py"
+      if dep.start_with?(".")
+        dots = dep[/\A\.+/].length
+        rest = dep[dots..].to_s.tr(".", "/")
+        dir = source_dir
+        (dots - 1).times { dir = File.dirname(dir) }
+        base = File.join(dir, rest)
+        ["#{base}.py", File.join(base, "__init__.py")].each do |rel|
+          candidates << rel if tracked.include?(rel)
+        end
+      else
+        base = dep.tr(".", "/")
+        ["#{base}.py", File.join(base, "__init__.py")].each do |rel|
+          candidates << rel if tracked.include?(rel)
+        end
+      end
+    when ".go"
+      return [] unless tracked.include?("go.mod")
+      module_path = safe_read(File.join(repo, "go.mod"))[/^\s*module\s+(\S+)/, 1]
+      return [] unless module_path
+      module_path = module_path.delete_prefix('"').delete_suffix('"')
+      return [] unless dep == module_path || dep.start_with?(module_path + "/")
+      directory = dep == module_path ? "." : dep.delete_prefix(module_path + "/")
+      tracked.each do |p|
+        next unless p.end_with?(".go")
+        candidates << p if File.dirname(p) == directory
+      end
+    end
+
+    candidates.uniq
+  end
+
+  def prerequisite_candidates(story_tasks, tracked_files)
+    return [[], {}] unless story_tasks
+    task = load_input(task_input)["data"]
+    return [[], {}] unless task.is_a?(Hash)
+    prereq_ids = Array(task["dependencies"]).select { |id| id.is_a?(String) && id.match?(/\AT\d+\z/i) }.map(&:upcase).uniq
+    return [[], {}] if prereq_ids.empty?
+
+    records = records_with_ids(story_tasks["data"])
+    prerequisites = records.select { |record| prereq_ids.include?(record["id"].to_s.upcase) }
+    return [[], {}] if prerequisites.empty?
+
+    words = extract_terms({ "task" => flatten_text(prerequisites), "story" => "" })
+    eligible = tracked_files.reject { |path| instruction_file?(path) || task_artifact?(path) }
+    matches = search_repo(eligible, words, [])
+    paths = matches.keys.sort_by { |path| [-matches[path].map { |match| match["pattern"] }.uniq.length, path] }
+    [paths, matches]
+  end
+
+  def task_artifact?(path)
+    absolute = File.expand_path(path, repo)
+    inputs = [task_input, story_input, story_tasks_input].compact
+    return true if inputs.any? { |input| File.file?(input) && File.expand_path(input) == absolute }
+    return false unless %w[.md .yaml .yml .json].include?(File.extname(path))
+
+    data = parse_structured(safe_read(absolute), File.extname(path))
+    return false unless data.is_a?(Hash)
+    data.key?("normalized_clauses") || data.key?("story") ||
+      records_with_ids(data).any? do |record|
+        record["id"].to_s.match?(/\AT\d+\z/i) && record.key?("required_behavior")
+      end
+  rescue Psych::Exception, JSON::ParserError
+    false
+  end
+
+  def candidate_record(path, matches)
+    limited_matches = matches.first(max_matches_per_file)
+    {
+      "path" => path,
+      "kind" => candidate_kind(path),
+      "score_evidence" => limited_matches,
+      "snippets" => build_snippets(path, limited_matches)
+    }
+  end
+
+  def build_snippets(path, matches)
+    return [] if max_snippet_lines <= 0
+    abs = File.join(repo, path)
+    return [] unless File.file?(abs)
+
+    lines = safe_read_lines(abs)
+    return [] if lines.empty?
+
+    match_lines = matches.map { |m| m["line"].to_i }.select(&:positive?).uniq.sort
+
+    if match_lines.empty?
+      finish = [lines.length, max_snippet_lines].min
+      return [{ "start_line" => 1, "end_line" => finish, "content" => snippet_content(lines, 1, finish, matches) }]
+    end
+
+    ranges = match_lines.map do |line_no|
+      start_line = [1, line_no - snippet_context].max
+      end_line = [lines.length, line_no + snippet_context].min
+      [start_line, end_line]
+    end
+
+    merged = merge_ranges(ranges)
+    merged.map do |start_line, end_line|
+      end_line = [end_line, start_line + max_snippet_lines - 1].min
+      {
+        "start_line" => start_line,
+        "end_line" => end_line,
+        "content" => snippet_content(lines, start_line, end_line, matches)
+      }
+    end
+  end
+
+  def bounded_line(line, pattern = nil)
+    return line if line.length <= MAX_LINE_CHARACTERS
+    marker = " [truncated] "
+    width = MAX_LINE_CHARACTERS - marker.length * 2
+    match_at = pattern ? line.index(Regexp.new(Regexp.escape(pattern), Regexp::IGNORECASE)).to_i : 0
+    start = [match_at - width / 2, 0].max
+    prefix = start.positive? ? marker : ""
+    suffix = start + width < line.length ? marker : ""
+    prefix + line[start, width] + suffix
+  end
+
+  def snippet_content(lines, start_line, end_line, matches)
+    patterns = {}
+    matches.each { |match| patterns[match["line"]] ||= match["pattern"] }
+    lines[(start_line - 1)..(end_line - 1)].each_with_index.map do |line, index|
+      bounded_line(line.chomp, patterns[start_line + index]) + (line.end_with?("\n") ? "\n" : "")
+    end.join
+  end
+
+  def merge_ranges(ranges)
+    merged = []
+    ranges.each do |start_line, end_line|
+      if merged.empty? || start_line > merged[-1][1] + 1
+        merged << [start_line, end_line]
+      else
+        merged[-1][1] = [merged[-1][1], end_line].max
+      end
+    end
+    merged
+  end
+
+  def apply_total_file_cap!(categories, tracked_files)
+    instructions = applicable_instructions([], tracked_files).first([max_files, max_total_files].min)
+    used = instructions.length
+    %w[decisions primary tests contracts dependencies prerequisites].each do |category|
+      retained = []
+      categories.fetch(category, []).each do |path|
+        break if retained.length >= max_files
+        next if instruction_file?(path)
+        needed = applicable_instructions([path], tracked_files) - instructions
+        # Do not retain a file without the instructions that govern it. If the
+        # instructions do not fit, skip the candidate instead of losing its rules.
+        next if instructions.length + needed.length > max_files
+        next if used + 1 + needed.length > max_total_files
+        retained << path
+        instructions.concat(needed)
+        used += 1 + needed.length
+      end
+      categories[category] = retained
+    end
+    categories["instructions"] = instructions
+  end
+
+  def dedupe_categories!(categories)
+    seen = Set.new
+    %w[instructions decisions primary tests contracts dependencies prerequisites].each do |category|
+      categories[category] = categories.fetch(category, []).reject do |path|
+        already = seen.include?(path)
+        seen << path unless already
+        already
+      end
+    end
+  end
+
+  def source_file?(path)
+    SOURCE_EXTENSIONS.include?(File.extname(path).downcase) || path.end_with?("Gemfile", "Rakefile", "Dockerfile")
+  end
+
+  def test_file?(path)
+    TEST_PATTERNS.any? { |pattern| path.match?(pattern) }
+  end
+
+  def contract_file?(path)
+    CONTRACT_PATTERNS.any? { |pattern| path.match?(pattern) }
+  end
+
+  def instruction_file?(path)
+    INSTRUCTION_PATTERNS.any? { |pattern| path.match?(pattern) }
+  end
+
+  def decision_file?(path)
+    DECISION_PATTERNS.any? { |pattern| path.match?(pattern) }
+  end
+
+  def candidate_kind(path)
+    return "instruction" if instruction_file?(path)
+    return "decision" if decision_file?(path)
+    return "test" if test_file?(path)
+    return "contract" if contract_file?(path)
+    return "source" if source_file?(path)
+    "other"
+  end
+
+  def ancestor_dirs(dir)
+    return ["."] if dir == "."
+    parts = dir.split("/")
+    dirs = ["."]
+    1.upto(parts.length) { |n| dirs << parts.first(n).join("/") }
+    dirs
+  end
+
+  def command_available?(command)
+    _out, _err, status = Open3.capture3("sh", "-c", "command -v #{command} >/dev/null 2>&1")
+    status.success?
+  end
+
+  def safe_read(path)
+    return "" unless safe_repo_file?(path)
+    text = File.read(path, encoding: "UTF-8")
+    text.valid_encoding? && !text.include?("\0") ? text : ""
+  rescue SystemCallError, ArgumentError, Encoding::InvalidByteSequenceError, Encoding::UndefinedConversionError
+    ""
+  end
+
+  def safe_read_lines(path)
+    safe_read(path).lines
+  end
+
+  def safe_repo_file?(path)
+    absolute = File.expand_path(path, repo)
+    return false unless absolute.start_with?(repo + File::SEPARATOR)
+
+    # Reject links at every component, including replaced tracked directories.
+    # Checking only the final filename would still permit an external directory.
+    current = repo
+    absolute.delete_prefix(repo + File::SEPARATOR).split(File::SEPARATOR).each do |part|
+      current = File.join(current, part)
+      return false if File.symlink?(current)
+    end
+    File.file?(absolute) && File.realpath(absolute).start_with?(File.realpath(repo) + File::SEPARATOR)
+  rescue SystemCallError
+    false
+  end
+
+  def relative_if_inside_repo(abs)
+    path = Pathname.new(abs).cleanpath
+    root = Pathname.new(repo).cleanpath
+    rel = path.relative_path_from(root).to_s
+    rel.start_with?("..") ? nil : rel
+  rescue ArgumentError
+    nil
+  end
+end
+
+options = {
+  max_files: ContextCandidates::DEFAULT_MAX_FILES,
+  max_total_files: ContextCandidates::DEFAULT_MAX_TOTAL_FILES,
+  max_matches_per_file: ContextCandidates::DEFAULT_MAX_MATCHES_PER_FILE,
+  snippet_context: ContextCandidates::DEFAULT_SNIPPET_CONTEXT,
+  max_snippet_lines: ContextCandidates::DEFAULT_MAX_SNIPPET_LINES
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = <<~USAGE
+    Usage:
+      context-candidates --repo PATH --task TEXT_OR_PATH --story TEXT_OR_PATH [options]
+
+    Emits a deterministic JSON candidate bundle to stdout.
+  USAGE
+
+  opts.on("--repo PATH", "Git repository root") { |v| options[:repo] = v }
+  opts.on("--task VALUE", "Task text or path to task file") { |v| options[:task] = v }
+  opts.on("--story VALUE", "Story text or path to story file") { |v| options[:story] = v }
+  opts.on("--story-tasks VALUE", "Optional sibling tasks text or file path") { |v| options[:story_tasks] = v }
+  opts.on("--base-revision REV", "Optional expected base revision") { |v| options[:base_revision] = v }
+  opts.on("--max-files N", Integer, "Maximum files per candidate category") { |v| options[:max_files] = v }
+  opts.on("--max-total-files N", Integer, "Maximum files across all categories") { |v| options[:max_total_files] = v }
+  opts.on("--max-matches-per-file N", Integer) { |v| options[:max_matches_per_file] = v }
+  opts.on("--snippet-context N", Integer, "Lines around each match") { |v| options[:snippet_context] = v }
+  opts.on("--max-snippet-lines N", Integer) { |v| options[:max_snippet_lines] = v }
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit 0
+  end
+end
+
+begin
+  parser.parse!
+  %i[repo task story].each do |required|
+    raise OptionParser::MissingArgument, "--#{required.to_s.tr('_', '-')}" unless options[required]
+  end
+
+  result = ContextCandidates.new(**options).run
+  puts JSON.pretty_generate(result)
+rescue StandardError => e
+  warn "context-candidates: #{e.message}"
+  exit 1
+end

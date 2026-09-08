@@ -1,0 +1,1 @@
+"""eBay Listing Assistant application."""

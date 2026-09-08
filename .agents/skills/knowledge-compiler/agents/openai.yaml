@@ -1,0 +1,4 @@
+interface:
+  display_name: "Knowledge Compiler"
+  short_description: "Promote reusable project knowledge durably"
+  default_prompt: "Use $knowledge-compiler to complete this task and promote only reusable knowledge into the narrowest canonical artifact."

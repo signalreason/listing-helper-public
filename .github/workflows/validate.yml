@@ -1,0 +1,45 @@
+name: Repository checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: false
+      - run: bin/validate-repo
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -m browser
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned scanner
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/trufflesecurity/trufflehog/releases/download/v3.97.4/trufflehog_3.97.4_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/trufflehog.tar.gz"
+          echo "dc24007c2f233bd61c05beabeb44aa27ea9b43288166279209abe0458c5ce76b  $RUNNER_TEMP/trufflehog.tar.gz" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/secret-scanner"
+          tar -xzf "$RUNNER_TEMP/trufflehog.tar.gz" -C "$RUNNER_TEMP/secret-scanner" trufflehog
+          echo "$RUNNER_TEMP/secret-scanner" >> "$GITHUB_PATH"
+      - run: bin/check-secrets

@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Reject common private outputs and non-example contact data in source files."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+LOCAL_USER = re.compile(r"/(?:Users|home)/[^/\s]+/|[A-Za-z]:\\Users\\[^\\\s]+")
+PRIVATE_SUFFIXES = {
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".log",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".dump",
+    ".backup",
+}
+EXAMPLE_DOMAINS = {"example.com", "example.org", "example.net"}
+
+
+def problems(name: str, data: bytes) -> list[tuple[int, str]]:
+    path = Path(name)
+    issues = []
+    if (
+        (path.name.startswith(".env") and path.name != ".env.example")
+        or path.suffix.lower() in PRIVATE_SUFFIXES
+        or {
+            "uploads",
+            "data",
+            "backups",
+            "private",
+            "test-results",
+            "playwright-report",
+        }.intersection(path.parts)
+        or path.name.endswith(".local.yaml")
+        or path.name.endswith(".sql.gz")
+        or (path.suffix.lower() == ".sql" and path.parts[0] != "migrations")
+    ):
+        issues.append((1, "private output must not be tracked"))
+    for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+        if LOCAL_USER.search(line):
+            issues.append((number, "local user path"))
+        for domain in EMAIL.findall(line):
+            if domain.lower() not in EXAMPLE_DOMAINS and not domain.lower().endswith(
+                ".example.com"
+            ):
+                issues.append((number, "non-example email address"))
+    return issues
+
+
+def main() -> int:
+    root = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
+    names = (
+        subprocess.check_output(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=root
+        )
+        .decode()
+        .split("\0")
+    )
+    failed = False
+    for name in sorted(set(filter(None, names))):
+        source = root / name
+        if source.is_symlink():
+            print(f"{name!r}: symbolic links require private review")
+            failed = True
+        elif source.is_file():
+            for line, reason in problems(name, source.read_bytes()):
+                print(f"{name!r}:{line}: {reason}")
+                failed = True
+    if not failed:
+        print("Public source file checks passed.")
+    return int(failed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

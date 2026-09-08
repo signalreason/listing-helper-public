@@ -1,0 +1,49 @@
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.tmp
+.gradle/
+build/
+**/build/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.backup
+backups/
+private/
+.do/*.local.yaml
+# SQL migrations are source code; database exports belong in backups/.
+*.sql.gz
+*.sql
+!migrations/*.sql
+
+# Common application output; narrow this after the implementation stack is selected.
+node_modules/
+dist/
+coverage/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+playwright-report/
+test-results/
+uploads/
+data/
+
+# Retired local runtime data may contain private inventory; keep it untracked until
+# the owner chooses to archive or remove it.
+runtime/local/inbox/
+runtime/local/state/
+runtime/local/plugins/

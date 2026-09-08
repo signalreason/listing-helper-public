@@ -1,0 +1,204 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+
+bin/check-public-files
+
+required_files="
+AGENTS.md
+PROJECT_STATE.md
+README.md
+LICENSE
+SECURITY.md
+SUPPORT.md
+.env.example
+docs/setup.md
+docs/user-guide.md
+docs/development.md
+docs/public-release.md
+bin/check-public-files
+bin/check-secrets
+app/privacy.html
+.github/workflows/validate.yml
+pyproject.toml
+uv.lock
+.python-version
+app/__init__.py
+app/main.py
+app/models.py
+app/images.py
+app/generation.py
+app/static/index.html
+app/static/styles.css
+app/static/app.js
+app/static/login.html
+app/static/login.js
+app/static/admin.html
+app/static/admin.js
+app/accounts.py
+app/api_models.py
+app/auth.py
+app/limits.py
+app/migrate.py
+app/ebay_api.py
+app/ebay_models.py
+app/ebay_routes.py
+app/ebay_security.py
+app/ebay_store.py
+app/trading_api.py
+migrations/0001_users.sql
+migrations/0002_ebay_integration.sql
+migrations/0003_saved_listing_drafts.sql
+tests/test_main.py
+tests/test_auth.py
+tests/test_limits.py
+tests/test_models.py
+tests/test_images.py
+tests/test_generation.py
+tests/test_ebay_api.py
+tests/test_ebay_routes.py
+tests/test_ebay_security.py
+tests/test_trading_api.py
+tests/browser/test_listing_flow.py
+docs/ebay-listing-assistant-plan.md
+docs/decisions/README.md
+docs/decisions/0001-browser-first-single-service.md
+docs/decisions/0002-server-owned-openai-credential.md
+docs/decisions/0003-digitalocean-app-platform.md
+docs/decisions/0004-python-fastapi-web-stack.md
+docs/decisions/0005-two-user-access-and-load-protection.md
+docs/decisions/0006-seller-hub-drafts-and-trading-adapter.md
+docs/decisions/0007-save-unfinished-listing-drafts.md
+.agents/skills/knowledge-compiler/SKILL.md
+.agents/project-log.md
+bin/validate-repo
+bin/start
+.do/app.yaml
+.do/README.md
+"
+
+for required_file in $required_files; do
+  if [ ! -f "$required_file" ]; then
+    echo "missing required file: $required_file" >&2
+    exit 1
+  fi
+done
+
+retired_paths="
+build.gradle.kts
+settings.gradle.kts
+contracts/build.gradle.kts
+filesystem-connect-plugin/build.gradle.kts
+integration-tests/build.gradle.kts
+openai-worker/build.gradle.kts
+ops-dashboard/build.gradle.kts
+orchestrator/build.gradle.kts
+runtime/local/compose.yaml
+schemas/README.md
+docs/kafka-driven-ebay-listing-generation-plan.md
+"
+
+for retired_path in $retired_paths; do
+  if [ -e "$retired_path" ]; then
+    echo "retired Kafka-era path still exists: $retired_path" >&2
+    exit 1
+  fi
+done
+
+python3 - "$repo_root" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+excluded_directories = {".git", ".venv", "node_modules"}
+markdown_files = sorted(
+    path
+    for path in root.rglob("*.md")
+    if not excluded_directories.intersection(path.relative_to(root).parts)
+)
+link_pattern = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
+
+for source in markdown_files:
+    text = source.read_text(encoding="utf-8")
+    for raw_target in link_pattern.findall(text):
+        target = raw_target.strip().split("#", 1)[0]
+        if not target or "://" in target or target.startswith("mailto:"):
+            continue
+        linked = (source.parent / target).resolve()
+        if not linked.exists():
+            raise SystemExit(f"{source.relative_to(root)}: broken link to {raw_target}")
+
+print(f"validated links in {len(markdown_files)} Markdown files")
+
+product_plan = root / "docs/ebay-listing-assistant-plan.md"
+product_plan_text = product_plan.read_text(encoding="utf-8")
+requirement_pattern = re.compile(
+    r"\*\*((?:PR|FR|AR|SR|TR|ER|LR|OA)-\d{3}[a-z]?):\*\*"
+)
+requirement_ids = set(requirement_pattern.findall(product_plan_text))
+traceability_start = "### 10.2 Requirement traceability"
+traceability_end = "### 10.3 WP-07 Production readiness: current work package"
+if traceability_start not in product_plan_text or traceability_end not in product_plan_text:
+    raise SystemExit("product plan is missing the required traceability section")
+traceability_text = product_plan_text.split(traceability_start, 1)[1].split(
+    traceability_end, 1
+)[0]
+unmapped_requirements = sorted(
+    requirement_id
+    for requirement_id in requirement_ids
+    if requirement_id not in traceability_text
+)
+if unmapped_requirements:
+    raise SystemExit(
+        "product plan has requirements without traceability: "
+        + ", ".join(unmapped_requirements)
+    )
+
+print(f"validated traceability for {len(requirement_ids)} product requirements")
+
+project_log = root / ".agents/project-log.md"
+project_log_lines = project_log.read_text(encoding="utf-8").splitlines()
+if len(project_log_lines) > 200:
+    raise SystemExit(
+        ".agents/project-log.md has more than 200 lines; promote durable knowledge "
+        "and compact the log"
+    )
+
+resolved_entries = sum(
+    line.startswith("### ")
+    for line in project_log_lines[
+        project_log_lines.index("## Recent resolved entries") + 1 :
+    ]
+)
+if resolved_entries > 10:
+    raise SystemExit(
+        ".agents/project-log.md has more than 10 resolved entries; keep the newest "
+        "useful entries and rely on Git history for older detail"
+    )
+
+print(
+    "validated project learning log "
+    f"({len(project_log_lines)} lines, {resolved_entries} resolved entries)"
+)
+PY
+
+if grep -R -n '\[TODO' .agents/skills/knowledge-compiler >/dev/null 2>&1; then
+  echo "knowledge-compiler skill still contains TODO placeholders" >&2
+  exit 1
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required for locked application validation" >&2
+  exit 1
+fi
+
+uv lock --check
+uv run ruff format --check . bin/check-secrets bin/check-public-files
+uv run ruff check . bin/check-secrets bin/check-public-files
+uv run pytest
+
+echo "repository baseline validation passed"

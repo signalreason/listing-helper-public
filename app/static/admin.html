@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Users · Listing Helper</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true">L</span>
+        <span>Listing Helper</span>
+      </a>
+      <a href="/">Back to listings</a>
+    </header>
+    <main>
+      <section class="hero compact-hero">
+        <p class="eyebrow">Owner only</p>
+        <h1>Users</h1>
+        <p class="hero-copy">Create the second household user or replace a forgotten password.</p>
+      </section>
+      <section class="workflow-card">
+        <form id="create-user-form" class="inline-form">
+          <div>
+            <label for="new-email">New user email address</label>
+            <input id="new-email" type="email" autocomplete="off" required />
+          </div>
+          <button class="primary-button" type="submit">Create user</button>
+        </form>
+        <div id="admin-error" class="message error-message" role="alert" hidden></div>
+        <div id="password-result" class="password-result" hidden>
+          <h2>Copy this password now</h2>
+          <p>It is shown only once. Send it directly to the user.</p>
+          <div class="copy-row">
+            <code id="generated-password"></code>
+            <button id="copy-password" class="secondary-button" type="button">Copy password</button>
+          </div>
+        </div>
+        <div id="user-list" class="user-list" aria-live="polite"></div>
+      </section>
+    </main>
+    <footer><a href="/privacy">Privacy Policy</a></footer>
+    <script type="module" src="/static/admin.js"></script>
+  </body>
+</html>

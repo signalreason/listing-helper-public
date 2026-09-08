@@ -1,0 +1,174 @@
+story:
+  normalized_clauses:
+    - {id: BEH-1, text: "The user can select a category group from a pre-populated menu."}
+    - {id: BEH-2, text: "The user can then select a category from a second menu populated for the selected category group."}
+    - {id: BEH-3, text: "The user selects a category group and category so that they do not have to spend time removing or editing item specifics and adding missing ones."}
+    - {id: ASM-1, text: "Assumption, unverified: eBay categories, item types, item specifics, and the relationships between them do not change."}
+    - {id: ASM-2, text: "Users sell men's, women's, and kids' clothing; shoes, bags, and accessories."}
+    - {id: TECH-1, text: "Retrieve categories for a group from eBay only if they are not available locally."}
+    - {id: TECH-2, text: "Once categories are retrieved for a group, store them."}
+    - {id: AC-1, text: "When the user visits the page, a dropdown list of category groups appears above Generate listing."}
+    - {id: AC-2, text: "Next to the category-group menu, a categories menu is populated when a group is selected."}
+    - {id: AC-3, text: "After a listing is generated, changing the category invalidates the generated listing and requires generation again with the new category. This is not automatic; the user must press Generate listing again."}
+    - {id: AC-4, text: "When the user selects a category and later returns to the draft, that category is still selected."}
+    - {id: AC-5, text: "Generated item specifics match those for the selected eBay category."}
+    - {id: AC-6, text: "Generated item-specific values are within the eBay-defined constraints."}
+
+tasks:
+  - id: T1
+    title: Reuse stored group categories
+    goal: >
+      Make each supported group's eBay categories available from local storage,
+      with retrieval from eBay only when the list is absent.
+    story_clauses: [ASM-1, ASM-2, TECH-1, TECH-2]
+    required_behavior:
+      - Provide category groups and their category relationships for the supported inventory in ASM-2.
+      - Return the stored categories for a group without another eBay category-list request when those categories are available locally.
+      - Retrieve a group's categories from eBay only when they are not available locally, then store the successful result for later use.
+      - Preserve each category's identity and group relationship so selection and later generation refer to the same eBay category.
+      - Keep failed retrievals distinct from successfully stored category lists so a later request can retry.
+    dependencies: []
+    non_goals:
+      - Menu rendering and selection behavior belong to T2.
+      - Draft selection persistence belongs to T3.
+      - Item-specific generation and value validation belong to T4.
+      - Scheduled taxonomy refresh or automatic category replacement is outside this story's stated assumption.
+    done_when:
+      - Tests with fake eBay data show that a local miss retrieves and stores the requested group's categories.
+      - A later request for that group uses the stored list and makes no eBay category-list request.
+      - Lists for different groups retain the correct category identities and relationships, including the inventory scope in ASM-2.
+      - A failed retrieval does not become a stored successful list, and a later request can succeed.
+
+  - id: T2
+    title: Select categories from group menus
+    goal: >
+      Let the user choose a category group and then its category from two
+      pre-populated menus before listing generation.
+    story_clauses: [BEH-1, BEH-2, ASM-1, ASM-2, TECH-1, TECH-2, AC-1, AC-2]
+    required_behavior:
+      - Show a category-group dropdown above Generate listing when the user visits the page.
+      - Show a category dropdown next to the group dropdown and populate it from the selected group's categories supplied by T1.
+      - Allow the user to choose a category without entering search text, and expose the selected category identity for generation and draft saving.
+      - When the group changes, replace the category choices with those for that group and clear any selection that does not belong to it.
+      - Keep an earlier group's delayed result from populating the menu after the user selects a different group.
+    dependencies: [T1]
+    non_goals:
+      - Do not add a second category retrieval or storage mechanism; use the outcome of T1.
+      - Saving and restoring draft selections belong to T3.
+      - Generated-specific validation belongs to T4, and invalidation after generation belongs to T5.
+    done_when:
+      - Browser tests show both menus in the required position on page entry.
+      - Selecting each supported group shows only categories that belong to that group, without a text search.
+      - Choosing a category exposes its eBay identity, and a group change cannot retain an unrelated category selection.
+      - A delayed response for an earlier group cannot overwrite the current group's choices.
+      - The two menus remain usable in phone and desktop layouts.
+
+  - id: T3
+    title: Restore saved category selections
+    goal: >
+      Restore the selected category and its group when the user returns to a draft.
+    story_clauses: [BEH-1, BEH-2, ASM-1, ASM-2, TECH-1, TECH-2, AC-4]
+    required_behavior:
+      - Preserve the selected category and enough group information with the draft to restore both menus.
+      - When a draft opens, restore its group, populate that group's categories, and select the category saved for that draft.
+      - Keep selections separate for different drafts so opening one draft does not apply another draft's category.
+      - Use the stored-category behavior from T1 during restoration, including when the category list is not yet available locally.
+    dependencies: [T2]
+    non_goals:
+      - Retrieval and storage of shared category lists remain owned by T1.
+      - Do not regenerate a listing when restoring its saved selection.
+      - Persisting and restoring category-change invalidation belongs to T5.
+    done_when:
+      - Saving and reopening a draft restores the same category and matching group in the menus.
+      - Opening two drafts with different selections restores each draft's own selection.
+      - Restoration succeeds with stored categories and after a required category-list retrieval.
+      - An earlier draft's delayed category load cannot replace the selection of the draft now open.
+
+  - id: T4
+    title: Generate valid category specifics
+    goal: >
+      Produce item specifics whose names and values meet the selected eBay
+      category's rules.
+    story_clauses: [BEH-2, BEH-3, ASM-1, ASM-2, AC-5, AC-6]
+    required_behavior:
+      - Use the selected eBay category and its item-specific rules to control generation.
+      - Include only item-specific names permitted for that category in the returned generated listing.
+      - Enforce the applicable eBay value constraints, including allowed values, number of values, length, type, format, and dependencies on other specifics.
+      - Validate generated output before returning it; omit invalid specifics and recheck dependent values so the retained result meets the category rules.
+      - Supply required specifics when supported by the photos or notes; identify required facts that still need seller input instead of inventing values.
+    dependencies: [T2]
+    non_goals:
+      - Category menus and category-list storage belong to T1 and T2.
+      - Persisting selections belongs to T3; category-change invalidation belongs to T5.
+      - Do not silently repair seller edits or invent unknown item facts to fill required specifics.
+    done_when:
+      - Fake eBay and model responses show that the selected category's rules control generated specifics.
+      - Valid single-value and multiple-value specifics survive validation.
+      - Unknown names and invalid values, repeated entries, formats, cardinalities, lengths, and dependent values do not remain in returned generated specifics.
+      - Required specifics supported by the supplied evidence are retained, while unknown required facts are identified without invented values.
+      - Categories within the inventory scope in ASM-2 have coverage, and tests spend no OpenAI credits.
+
+  - id: T5
+    title: Require generation after category changes
+    goal: >
+      Require an explicit new generation when the user changes the category of
+      an already generated listing.
+    story_clauses: [BEH-2, BEH-3, ASM-1, ASM-2, AC-3, AC-4, AC-5, AC-6]
+    required_behavior:
+      - Mark the generated listing invalid when its selected category changes, and make the need to generate again clear to the user.
+      - Keep the invalid listing from being treated as ready for publication under the changed category.
+      - Start generation for the new category only when the user presses Generate listing; a category change alone must not start it.
+      - Preserve the selected category and invalid state when the draft is saved and reopened, and retain that state after failed generation.
+      - Clear the invalid state only after successful generation for the changed category, using the valid-specific behavior from T4.
+    dependencies: [T3, T4]
+    non_goals:
+      - Do not implement automatic regeneration or automatic repair of the previous listing's specifics.
+      - Category-list storage, menu rendering, and selection restoration remain owned by T1 through T3.
+      - Do not duplicate the item-specific validation owned by T4.
+    done_when:
+      - A generated listing becomes invalid after a category change, with no model request until Generate listing is pressed.
+      - Saving and reopening that draft retains the new category and still requires generation before publication.
+      - A failed generation leaves the listing invalid and permits an explicit retry with the selected category.
+      - Successful generation uses the new category, returns specifics that meet AC-5 and AC-6, and clears the invalid state.
+      - An end-to-end test covers group selection, category selection, generation, category change, draft reopening, and explicit generation again.
+
+coverage:
+  BEH-1:
+    primary_task: T2
+    supporting_tasks: [T3]
+  BEH-2:
+    primary_task: T2
+    supporting_tasks: [T3, T4, T5]
+  BEH-3:
+    primary_task: T4
+    supporting_tasks: [T5]
+  ASM-1:
+    primary_task: T1
+    supporting_tasks: [T2, T3, T4, T5]
+  ASM-2:
+    primary_task: T1
+    supporting_tasks: [T2, T3, T4, T5]
+  TECH-1:
+    primary_task: T1
+    supporting_tasks: [T2, T3]
+  TECH-2:
+    primary_task: T1
+    supporting_tasks: [T2, T3]
+  AC-1:
+    primary_task: T2
+    supporting_tasks: []
+  AC-2:
+    primary_task: T2
+    supporting_tasks: []
+  AC-3:
+    primary_task: T5
+    supporting_tasks: []
+  AC-4:
+    primary_task: T3
+    supporting_tasks: [T5]
+  AC-5:
+    primary_task: T4
+    supporting_tasks: [T5]
+  AC-6:
+    primary_task: T4
+    supporting_tasks: [T5]
